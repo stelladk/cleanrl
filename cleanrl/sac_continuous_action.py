@@ -4,6 +4,8 @@ import random
 import time
 from dataclasses import dataclass
 
+from debug.sac_debug import compute_grad_norm, log_grad_norms, log_log_pi_stats, log_q_stats
+
 import gymnasium as gym
 import numpy as np
 import torch
@@ -64,6 +66,8 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+    debug: bool = False
+    """if toggled, log additional diagnostic metrics (grad norms, Q-value stats, log-pi stats)"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -218,6 +222,8 @@ if __name__ == "__main__":
         handle_timeout_termination=False,
     )
     start_time = time.time()
+    if args.debug:
+        qf_grad_norm = actor_grad_norm = alpha_grad_norm = 0.0
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
@@ -270,6 +276,8 @@ if __name__ == "__main__":
             # optimize the model
             q_optimizer.zero_grad()
             qf_loss.backward()
+            if args.debug:
+                qf_grad_norm = compute_grad_norm(qf1, qf2)
             q_optimizer.step()
 
             if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
@@ -284,6 +292,8 @@ if __name__ == "__main__":
 
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
+                    if args.debug:
+                        actor_grad_norm = compute_grad_norm(actor)
                     actor_optimizer.step()
 
                     if args.autotune:
@@ -293,6 +303,8 @@ if __name__ == "__main__":
 
                         a_optimizer.zero_grad()
                         alpha_loss.backward()
+                        if args.debug:
+                            alpha_grad_norm = compute_grad_norm(log_alpha)
                         a_optimizer.step()
                         alpha = log_alpha.exp().item()
 
@@ -319,6 +331,11 @@ if __name__ == "__main__":
                 )
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+                if args.debug:
+                    log_grad_norms(writer, global_step, qf_grad_norm, actor_grad_norm,
+                                   alpha_grad_norm if args.autotune else None)
+                    log_q_stats(writer, global_step, qf1_a_values, qf2_a_values, next_q_value)
+                    log_log_pi_stats(writer, global_step, log_pi, next_state_log_pi)
 
     envs.close()
     writer.close()
