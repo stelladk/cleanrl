@@ -3,8 +3,10 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from typing import cast
 
 from debug.sac_debug import compute_grad_norm, log_grad_norms, log_log_pi_stats, log_q_stats
+from debug.split_replay_buffer import SplitReplayBuffer
 
 import gymnasium as gym
 import numpy as np
@@ -68,6 +70,8 @@ class Args:
     """automatic tuning of the entropy coefficient"""
     debug: bool = False
     """if toggled, log additional diagnostic metrics (grad norms, Q-value stats, log-pi stats)"""
+    holdout_fraction: float = 0.1
+    """fraction of the replay buffer held out (debug mode only) for separate metric logging"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -213,14 +217,26 @@ if __name__ == "__main__":
         alpha = args.alpha
 
     envs.single_observation_space.dtype = np.float32
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        n_envs=args.num_envs,
-        handle_timeout_termination=False,
-    )
+    if args.debug:
+        rb = SplitReplayBuffer(
+            args.buffer_size,
+            envs.single_observation_space,
+            envs.single_action_space,
+            device,
+            n_envs=args.num_envs,
+            handle_timeout_termination=False,
+            holdout_fraction=args.holdout_fraction,
+            min_train_size=args.batch_size,
+        )
+    else:
+        rb = ReplayBuffer(
+            args.buffer_size,
+            envs.single_observation_space,
+            envs.single_action_space,
+            device,
+            n_envs=args.num_envs,
+            handle_timeout_termination=False,
+        )
     start_time = time.time()
     if args.debug:
         qf_grad_norm = actor_grad_norm = alpha_grad_norm = 0.0
@@ -336,6 +352,38 @@ if __name__ == "__main__":
                                    alpha_grad_norm if args.autotune else None)
                     log_q_stats(writer, global_step, qf1_a_values, qf2_a_values, next_q_value)
                     log_log_pi_stats(writer, global_step, log_pi, next_state_log_pi)
+
+                    # Same metrics computed on held-out transitions never used for training,
+                    # to compare against the training-batch stats above.
+                    split_rb = cast(SplitReplayBuffer, rb)
+                    if split_rb.holdout_size() >= args.batch_size:
+                        holdout_data = split_rb.sample_holdout(args.batch_size)
+                        with torch.no_grad():
+                            holdout_next_state_actions, holdout_next_state_log_pi, _ = actor.get_action(
+                                holdout_data.next_observations
+                            )
+                            holdout_qf1_next_target = qf1_target(holdout_data.next_observations, holdout_next_state_actions)
+                            holdout_qf2_next_target = qf2_target(holdout_data.next_observations, holdout_next_state_actions)
+                            holdout_min_qf_next_target = (
+                                torch.min(holdout_qf1_next_target, holdout_qf2_next_target)
+                                - alpha * holdout_next_state_log_pi
+                            )
+                            holdout_next_q_value = holdout_data.rewards.flatten() + (
+                                1 - holdout_data.dones.flatten()
+                            ) * args.gamma * holdout_min_qf_next_target.view(-1)
+
+                            holdout_qf1_a_values = qf1(holdout_data.observations, holdout_data.actions).view(-1)
+                            holdout_qf2_a_values = qf2(holdout_data.observations, holdout_data.actions).view(-1)
+                            _, holdout_log_pi, _ = actor.get_action(holdout_data.observations)
+
+                        log_q_stats(
+                            writer, global_step, holdout_qf1_a_values, holdout_qf2_a_values, holdout_next_q_value,
+                            prefix="holdout",
+                        )
+                        log_log_pi_stats(
+                            writer, global_step, holdout_log_pi, holdout_next_state_log_pi,
+                            prefix="holdout",
+                        )
 
     envs.close()
     writer.close()

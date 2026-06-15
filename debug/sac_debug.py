@@ -40,15 +40,16 @@ def log_q_stats(
     qf1_a_values: torch.Tensor,
     qf2_a_values: torch.Tensor,
     next_q_value: torch.Tensor,
+    prefix: str = "debug",
 ) -> None:
-    writer.add_scalar("debug/qf1_values_min", qf1_a_values.min().item(), global_step)
-    writer.add_scalar("debug/qf1_values_max", qf1_a_values.max().item(), global_step)
-    writer.add_scalar("debug/qf1_values_std", qf1_a_values.std().item(), global_step)
-    writer.add_scalar("debug/qf2_values_min", qf2_a_values.min().item(), global_step)
-    writer.add_scalar("debug/qf2_values_max", qf2_a_values.max().item(), global_step)
-    writer.add_scalar("debug/qf2_values_std", qf2_a_values.std().item(), global_step)
-    writer.add_scalar("debug/target_q_mean", next_q_value.mean().item(), global_step)
-    writer.add_scalar("debug/target_q_std", next_q_value.std().item(), global_step)
+    writer.add_scalar(f"{prefix}/qf1_values_min", qf1_a_values.min().item(), global_step)
+    writer.add_scalar(f"{prefix}/qf1_values_max", qf1_a_values.max().item(), global_step)
+    writer.add_scalar(f"{prefix}/qf1_values_std", qf1_a_values.std().item(), global_step)
+    writer.add_scalar(f"{prefix}/qf2_values_min", qf2_a_values.min().item(), global_step)
+    writer.add_scalar(f"{prefix}/qf2_values_max", qf2_a_values.max().item(), global_step)
+    writer.add_scalar(f"{prefix}/qf2_values_std", qf2_a_values.std().item(), global_step)
+    writer.add_scalar(f"{prefix}/target_q_mean", next_q_value.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/target_q_std", next_q_value.std().item(), global_step)
 
 
 def log_log_pi_stats(
@@ -56,8 +57,9 @@ def log_log_pi_stats(
     global_step: int,
     log_pi: torch.Tensor,
     next_state_log_pi: torch.Tensor,
+    prefix: str = "debug",
 ) -> None:
-    writer.add_scalar("debug/log_pi_mean", log_pi.mean().item(), global_step)
-    writer.add_scalar("debug/log_pi_std", log_pi.std().item(), global_step)
-    writer.add_scalar("debug/next_state_log_pi_mean", next_state_log_pi.mean().item(), global_step)
-    writer.add_scalar("debug/next_state_log_pi_std", next_state_log_pi.std().item(), global_step)
+    writer.add_scalar(f"{prefix}/log_pi_mean", log_pi.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/log_pi_std", log_pi.std().item(), global_step)
+    writer.add_scalar(f"{prefix}/next_state_log_pi_mean", next_state_log_pi.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/next_state_log_pi_std", next_state_log_pi.std().item(), global_step)
