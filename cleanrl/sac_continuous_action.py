@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import cast
 
-from debug.sac_debug import compute_grad_norm, log_grad_norms, log_log_pi_stats, log_q_stats
+from debug.sac_debug import *
 from debug.split_replay_buffer import SplitReplayBuffer
 
 import gymnasium as gym
@@ -98,11 +98,13 @@ class SoftQNetwork(nn.Module):
         )
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
+        self.relu1 = nn.ReLU()
+        self.relu2 = nn.ReLU()
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.relu1(self.fc1(x))
+        x = self.relu2(self.fc2(x))
         x = self.fc3(x)
         return x
 
@@ -118,6 +120,8 @@ class Actor(nn.Module):
         self.fc2 = nn.Linear(256, 256)
         self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
+        self.relu1 = nn.ReLU()
+        self.relu2 = nn.ReLU()
         # action rescaling
         self.register_buffer(
             "action_scale",
@@ -135,8 +139,8 @@ class Actor(nn.Module):
         )
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        x = self.relu1(self.fc1(x))
+        x = self.relu2(self.fc2(x))
         mean = self.fc_mean(x)
         log_std = self.fc_logstd(x)
         log_std = torch.tanh(log_std)
