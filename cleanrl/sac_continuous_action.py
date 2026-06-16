@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
+from warnings import warn
 from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers import ReplayBuffer
@@ -73,6 +74,14 @@ class Args:
     holdout_fraction: float = 0.1
     """fraction of the replay buffer held out (debug mode only) for separate metric logging"""
 
+    # Architecture
+    selu: bool = False
+    """use selu activation function instead of relu"""
+    batchnorm: bool = False
+    """use BatchNorm in the critic"""
+    layernorm: bool = False
+    """use LayerNorm in the critic"""
+
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     def thunk():
@@ -90,7 +99,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 # ALGO LOGIC: initialize agent here:
 class SoftQNetwork(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, selu: bool, batchnorm: bool, layernorm: bool):
         super().__init__()
         self.fc1 = nn.Linear(
             np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape),
@@ -98,13 +107,27 @@ class SoftQNetwork(nn.Module):
         )
         self.fc2 = nn.Linear(256, 256)
         self.fc3 = nn.Linear(256, 1)
-        self.relu1 = nn.ReLU()
-        self.relu2 = nn.ReLU()
+        self.relu1 = nn.SELU() if selu else nn.ReLU()
+        self.relu2 = nn.SELU() if selu else nn.ReLU()
+
+        if layernorm:
+            self.norm1 = nn.LayerNorm(256)
+            self.norm2 = nn.LayerNorm(256)
+            if selu:
+                warn("SeLU is self-normalizing and normalization is redundant", UserWarning)
+        elif batchnorm:
+            self.norm1 = nn.BatchNorm1d(256)
+            self.norm2 = nn.BatchNorm1d(256)
+            if selu:
+                warn("SeLU is self-normalizing and normalization is redundant", UserWarning)
+        else:
+            self.norm1 = nn.Identity()
+            self.norm2 = nn.Identity()
 
     def forward(self, x, a):
         x = torch.cat([x, a], 1)
-        x = self.relu1(self.fc1(x))
-        x = self.relu2(self.fc2(x))
+        x = self.relu1(self.norm1(self.fc1(x)))
+        x = self.relu2(self.norm2(self.fc2(x)))
         x = self.fc3(x)
         return x
 
@@ -114,14 +137,14 @@ LOG_STD_MIN = -5
 
 
 class Actor(nn.Module):
-    def __init__(self, env):
+    def __init__(self, env, selu: bool):
         super().__init__()
         self.fc1 = nn.Linear(np.array(env.single_observation_space.shape).prod(), 256)
         self.fc2 = nn.Linear(256, 256)
         self.fc_mean = nn.Linear(256, np.prod(env.single_action_space.shape))
         self.fc_logstd = nn.Linear(256, np.prod(env.single_action_space.shape))
-        self.relu1 = nn.ReLU()
-        self.relu2 = nn.ReLU()
+        self.relu1 = nn.SELU() if selu else nn.ReLU()
+        self.relu2 = nn.SELU() if selu else nn.ReLU()
         # action rescaling
         self.register_buffer(
             "action_scale",
@@ -201,11 +224,11 @@ if __name__ == "__main__":
 
     max_action = float(envs.single_action_space.high[0])
 
-    actor = Actor(envs).to(device)
-    qf1 = SoftQNetwork(envs).to(device)
-    qf2 = SoftQNetwork(envs).to(device)
-    qf1_target = SoftQNetwork(envs).to(device)
-    qf2_target = SoftQNetwork(envs).to(device)
+    actor = Actor(envs, selu=args.selu).to(device)
+    qf1 = SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm).to(device)
+    qf2 = SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm).to(device)
+    qf1_target = SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm).to(device)
+    qf2_target = SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
