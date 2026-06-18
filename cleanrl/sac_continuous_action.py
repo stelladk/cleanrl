@@ -166,6 +166,7 @@ class ResidualBlock(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         self.fc1 = nn.Linear(hidden_dim, hidden_dim * 4)
         self.fc2 = nn.Linear(hidden_dim * 4, hidden_dim)
+        self.relu = nn.ReLU()
         nn.init.kaiming_normal_(self.fc1.weight, mode="fan_in", nonlinearity="relu")
         nn.init.zeros_(self.fc1.bias)
         nn.init.kaiming_normal_(self.fc2.weight, mode="fan_in", nonlinearity="relu")
@@ -174,7 +175,7 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         residual = x
         x = self.norm(x)
-        x = F.relu(self.fc1(x))
+        x = self.relu(self.fc1(x))
         x = self.fc2(x)
         return residual + x
 
