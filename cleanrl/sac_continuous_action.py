@@ -81,16 +81,28 @@ class Args:
     """use BatchNorm in the critic"""
     layernorm: bool = False
     """use LayerNorm in the critic"""
-    simba: bool = False
+    critic_simba: bool = False
     """use the SimBa residual critic architecture (https://github.com/SonyResearch/simba) instead of the plain MLP critic"""
     critic_hidden_dim: int = 512
-    """hidden dimension of the critic network (only used when --simba is set; SimBa paper uses 512)"""
+    """hidden dimension of the critic network (only used when --critic-simba is set; SimBa paper uses 512)"""
     critic_num_blocks: int = 2
-    """number of residual blocks in the critic (only used when --simba is set; SimBa paper uses 2)"""
+    """number of residual blocks in the critic (only used when --critic-simba is set; SimBa paper uses 2)"""
     critic_weight_decay: float = 0.0
-    """weight decay for the critic optimizer (AdamW); SimBa paper uses 1e-2 together with --simba"""
+    """weight decay for the critic optimizer (AdamW); SimBa paper uses 1e-2 together with --critic-simba"""
+    actor_simba: bool = False
+    """use the SimBa residual actor architecture (https://github.com/SonyResearch/simba) instead of the plain MLP actor"""
+    actor_hidden_dim: int = 128
+    """hidden dimension of the actor network (only used when --actor-simba is set; SimBa paper uses 128)"""
+    actor_num_blocks: int = 1
+    """number of residual blocks in the actor (only used when --actor-simba is set; SimBa paper uses 1)"""
+    actor_weight_decay: float = 0.0
+    """weight decay for the actor optimizer (AdamW); SimBa paper uses 1e-2 together with --actor-simba"""
     normalize_observation: bool = False
-    """normalize observations with a running mean/std wrapper; SimBa paper enables this together with --simba"""
+    """normalize observations with a running mean/std wrapper; SimBa paper enables this together with --critic-simba/--actor-simba"""
+    temp_target_entropy_coef: float = -1.0
+    """target entropy = temp_target_entropy_coef * action_dim (autotune only); SimBa paper uses -0.5 instead of -1.0"""
+    temp_initial_value: float = 1.0
+    """initial entropy coefficient alpha (autotune only); SimBa paper uses 0.01 instead of 1.0"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name, normalize_observation):
@@ -195,7 +207,7 @@ class SimbaQNetwork(nn.Module):
 
 
 def make_critic(envs: gym.vector.VectorEnv, args: Args) -> nn.Module:
-    if args.simba:
+    if args.critic_simba:
         return SimbaQNetwork(envs, hidden_dim=args.critic_hidden_dim, num_blocks=args.critic_num_blocks)
     return SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm)
 
@@ -254,6 +266,61 @@ class Actor(nn.Module):
         return action, log_prob, mean
 
 
+class SimbaActor(Actor):
+    """SAC actor using the SimBa architecture (https://github.com/SonyResearch/simba):
+    input projection, residual blocks, closing LayerNorm, then orthogonal-initialized
+    mean/log-std heads. Subclasses `Actor` purely to reuse `get_action`; the
+    architecture (`forward`) is unrelated to `Actor.__init__`, so it is not called."""
+
+    def __init__(self, env, hidden_dim: int, num_blocks: int):
+        nn.Module.__init__(self)
+        obs_dim = np.array(env.single_observation_space.shape).prod()
+        action_dim = np.prod(env.single_action_space.shape)
+        self.input_proj = nn.Linear(obs_dim, hidden_dim)
+        nn.init.orthogonal_(self.input_proj.weight, gain=1.0)
+        nn.init.zeros_(self.input_proj.bias)
+        self.blocks = nn.ModuleList([ResidualBlock(hidden_dim) for _ in range(num_blocks)])
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.fc_mean = nn.Linear(hidden_dim, action_dim)
+        self.fc_logstd = nn.Linear(hidden_dim, action_dim)
+        nn.init.orthogonal_(self.fc_mean.weight, gain=1.0)
+        nn.init.zeros_(self.fc_mean.bias)
+        nn.init.orthogonal_(self.fc_logstd.weight, gain=1.0)
+        nn.init.zeros_(self.fc_logstd.bias)
+        # action rescaling
+        self.register_buffer(
+            "action_scale",
+            torch.tensor(
+                (env.single_action_space.high - env.single_action_space.low) / 2.0,
+                dtype=torch.float32,
+            ),
+        )
+        self.register_buffer(
+            "action_bias",
+            torch.tensor(
+                (env.single_action_space.high + env.single_action_space.low) / 2.0,
+                dtype=torch.float32,
+            ),
+        )
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.final_norm(x)
+        mean = self.fc_mean(x)
+        log_std = self.fc_logstd(x)
+        log_std = torch.tanh(log_std)
+        log_std = LOG_STD_MIN + 0.5 * (LOG_STD_MAX - LOG_STD_MIN) * (log_std + 1)
+        return mean, log_std
+
+
+def make_actor(envs: gym.vector.VectorEnv, args: Args) -> nn.Module:
+    if args.actor_simba:
+        return SimbaActor(envs, hidden_dim=args.actor_hidden_dim, num_blocks=args.actor_num_blocks)
+    return Actor(envs, selu=args.selu)
+
+
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
@@ -295,7 +362,7 @@ if __name__ == "__main__":
 
     max_action = float(envs.single_action_space.high[0])
 
-    actor = Actor(envs, selu=args.selu).to(device)
+    actor = make_actor(envs, args).to(device)
     qf1 = make_critic(envs, args).to(device)
     qf2 = make_critic(envs, args).to(device)
     qf1_target = make_critic(envs, args).to(device)
@@ -305,12 +372,12 @@ if __name__ == "__main__":
     q_optimizer = optim.AdamW(
         list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr, weight_decay=args.critic_weight_decay
     )
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    actor_optimizer = optim.AdamW(list(actor.parameters()), lr=args.policy_lr, weight_decay=args.actor_weight_decay)
 
     # Automatic entropy tuning
     if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        target_entropy = args.temp_target_entropy_coef * torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
+        log_alpha = torch.full((1,), float(np.log(args.temp_initial_value)), requires_grad=True, device=device)
         alpha = log_alpha.exp().item()
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
