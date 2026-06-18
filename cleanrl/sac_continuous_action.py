@@ -81,9 +81,19 @@ class Args:
     """use BatchNorm in the critic"""
     layernorm: bool = False
     """use LayerNorm in the critic"""
+    simba: bool = False
+    """use the SimBa residual critic architecture (https://github.com/SonyResearch/simba) instead of the plain MLP critic"""
+    critic_hidden_dim: int = 512
+    """hidden dimension of the critic network (only used when --simba is set; SimBa paper uses 512)"""
+    critic_num_blocks: int = 2
+    """number of residual blocks in the critic (only used when --simba is set; SimBa paper uses 2)"""
+    critic_weight_decay: float = 0.0
+    """weight decay for the critic optimizer (AdamW); SimBa paper uses 1e-2 together with --simba"""
+    normalize_observation: bool = False
+    """normalize observations with a running mean/std wrapper; SimBa paper enables this together with --simba"""
 
 
-def make_env(env_id, seed, idx, capture_video, run_name):
+def make_env(env_id, seed, idx, capture_video, run_name, normalize_observation):
     def thunk():
         if capture_video and idx == 0:
             env = gym.make(env_id, render_mode="rgb_array")
@@ -91,6 +101,8 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         else:
             env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
+        if normalize_observation:
+            env = gym.wrappers.NormalizeObservation(env)
         env.action_space.seed(seed)
         return env
 
@@ -130,6 +142,62 @@ class SoftQNetwork(nn.Module):
         x = self.relu2(self.norm2(self.fc2(x)))
         x = self.fc3(x)
         return x
+
+
+class ResidualBlock(nn.Module):
+    """Pre-LayerNorm residual block with a 4x-expansion ReLU MLP, as used in SimBa
+    (https://github.com/SonyResearch/simba) to let depth scale without losing the
+    identity path."""
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim * 4)
+        self.fc2 = nn.Linear(hidden_dim * 4, hidden_dim)
+        nn.init.kaiming_normal_(self.fc1.weight, mode="fan_in", nonlinearity="relu")
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.kaiming_normal_(self.fc2.weight, mode="fan_in", nonlinearity="relu")
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return residual + x
+
+
+class SimbaQNetwork(nn.Module):
+    """SAC critic using the SimBa architecture (https://github.com/SonyResearch/simba):
+    an input projection, a stack of residual blocks, a closing LayerNorm, and a linear
+    head, orthogonal-initialized at the projection/head so the residual stream starts
+    near-identity."""
+
+    def __init__(self, env, hidden_dim: int, num_blocks: int):
+        super().__init__()
+        input_dim = np.array(env.single_observation_space.shape).prod() + np.prod(env.single_action_space.shape)
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        nn.init.orthogonal_(self.input_proj.weight, gain=1.0)
+        nn.init.zeros_(self.input_proj.bias)
+        self.blocks = nn.ModuleList([ResidualBlock(hidden_dim) for _ in range(num_blocks)])
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Linear(hidden_dim, 1)
+        nn.init.orthogonal_(self.head.weight, gain=1.0)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, x, a):
+        x = torch.cat([x, a], 1)
+        x = self.input_proj(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.final_norm(x)
+        return self.head(x)
+
+
+def make_critic(envs: gym.vector.VectorEnv, args: Args) -> nn.Module:
+    if args.simba:
+        return SimbaQNetwork(envs, hidden_dim=args.critic_hidden_dim, num_blocks=args.critic_num_blocks)
+    return SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm)
 
 
 LOG_STD_MAX = 2
@@ -218,20 +286,25 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
+        [
+            make_env(args.env_id, args.seed + i, i, args.capture_video, run_name, args.normalize_observation)
+            for i in range(args.num_envs)
+        ]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     max_action = float(envs.single_action_space.high[0])
 
     actor = Actor(envs, selu=args.selu).to(device)
-    qf1 = SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm).to(device)
-    qf2 = SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm).to(device)
-    qf1_target = SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm).to(device)
-    qf2_target = SoftQNetwork(envs, selu=args.selu, batchnorm=args.batchnorm, layernorm=args.layernorm).to(device)
+    qf1 = make_critic(envs, args).to(device)
+    qf2 = make_critic(envs, args).to(device)
+    qf1_target = make_critic(envs, args).to(device)
+    qf2_target = make_critic(envs, args).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
+    q_optimizer = optim.AdamW(
+        list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr, weight_decay=args.critic_weight_decay
+    )
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     # Automatic entropy tuning
