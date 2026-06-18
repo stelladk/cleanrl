@@ -355,6 +355,19 @@ if __name__ == "__main__":
         DEBUG_GRAD_VARIANCE_FREQ = 5_000   # gradient variance/SNR (train buffer)
         DEBUG_SHARPNESS_FREQ = 25_000      # critic Hessian sharpness (fixed reference batch, frozen a')
 
+        # Simplicity bias score (SimBa, Appendix A/B) characterizes the
+        # critic *architecture's* init distribution, not the trained network,
+        # so it's logged once at the start rather than on a training cadence.
+        log_simplicity_bias(
+            writer,
+            global_step=0,
+            model_fn=lambda: make_critic(envs, args),
+            obs_dim=int(np.array(envs.single_observation_space.shape).prod()),
+            action_dim=int(np.prod(envs.single_action_space.shape)),
+            device=device,
+            name="critic",
+        )
+
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):

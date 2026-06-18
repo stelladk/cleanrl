@@ -367,6 +367,134 @@ def normalized_sharpness(
     }
 
 
+def function_complexity(output_grid: torch.Tensor) -> float:
+    """Frequency-weighted average of the 2D discrete Fourier spectrum
+    magnitude of `output_grid`, per SimBa (https://arxiv.org/abs/2410.09754)
+    Appendix A.1/B eq. (10)/(14): c(f) = sum_k |f-hat(k)| . |k| / sum_k |f-hat(k)|.
+
+    The paper's complexity measure is defined for a 1D frequency index k; on a
+    2D grid we use the radial frequency magnitude ||(kx, ky)|| as the per-bin
+    weight, the natural 2D generalization.
+
+    Parameters
+    ----------
+    output_grid : torch.Tensor
+        (H, W) grid of scalar network outputs over a 2D input slice
+
+    Returns
+    -------
+    float
+        complexity measure c(f); lower means the function is smoother/simpler
+    """
+    spectrum = torch.fft.fft2(output_grid.double())
+    magnitude = spectrum.abs()
+    h, w = output_grid.shape
+    ky = torch.fft.fftfreq(h, device=output_grid.device) * h
+    kx = torch.fft.fftfreq(w, device=output_grid.device) * w
+    k_norm = torch.sqrt(ky[:, None] ** 2 + kx[None, :] ** 2)
+    return (magnitude * k_norm).sum().item() / magnitude.sum().item()
+
+
+def sample_function_grid(
+    model: nn.Module,
+    obs_dim: int,
+    action_dim: int,
+    grid_size: int = 300,
+    input_range: float = 100.0,
+    device: torch.device = torch.device("cpu"),
+) -> torch.Tensor:
+    """Evaluate `model` over a `grid_size` x `grid_size` grid spanning
+    X = [-input_range, input_range]^2, following the Neural Redshift / SimBa
+    Appendix B methodology for estimating function complexity.
+
+    SAC critics take a (obs_dim + action_dim)-dimensional input rather than
+    the 2D input used in the paper's toy analysis, so the 2D grid coordinates
+    are mapped into the critic's actual input space through two fixed random
+    orthonormal directions (a random 2D slice through the origin).
+
+    Parameters
+    ----------
+    model : nn.Module
+        critic called as `model(observations, actions)`
+    obs_dim : int
+        observation dimension (first `obs_dim` columns of the projected input)
+    action_dim : int
+        action dimension (remaining columns of the projected input)
+    grid_size : int, optional
+        grid resolution per axis, by default 300 (90,000 points, as in the paper)
+    input_range : float, optional
+        grid spans [-input_range, input_range] per axis, by default 100.0
+    device : torch.device, optional
+        device to run the forward pass on, by default cpu
+
+    Returns
+    -------
+    torch.Tensor
+        (grid_size, grid_size) grid of scalar network outputs
+    """
+    coords = torch.linspace(-input_range, input_range, grid_size, device=device)
+    x1, x2 = torch.meshgrid(coords, coords, indexing="ij")
+    grid = torch.stack([x1.flatten(), x2.flatten()], dim=1)  # (grid_size^2, 2)
+
+    # Fixed random orthonormal basis spanning a 2D subspace of the input space.
+    basis = torch.linalg.qr(torch.randn(obs_dim + action_dim, 2, device=device))[0]
+    inputs = grid @ basis.T  # (grid_size^2, obs_dim + action_dim)
+
+    with torch.no_grad():
+        outputs = model(inputs[:, :obs_dim], inputs[:, obs_dim:])
+
+    return outputs.view(grid_size, grid_size)
+
+
+def simplicity_bias_score(
+    model_fn: Callable[[], nn.Module],
+    obs_dim: int,
+    action_dim: int,
+    n_init: int = 100,
+    grid_size: int = 300,
+    input_range: float = 100.0,
+    device: torch.device = torch.device("cpu"),
+) -> float:
+    """SimBa's simplicity bias score s(f), Appendix A.2/B eq. (13)/(15): the
+    average, over `n_init` fresh random initializations of an architecture, of
+    the inverse function-complexity (`function_complexity`) measured on a
+    random 2D slice of the input space (`sample_function_grid`). Higher means
+    the architecture is more biased toward simple, low-frequency functions at
+    initialization — it is a property of the architecture and its init
+    distribution, not of any particular trained network.
+
+    Parameters
+    ----------
+    model_fn : Callable[[], nn.Module]
+        returns a freshly, randomly initialized instance of the architecture
+        each call, e.g. `lambda: make_critic(envs, args)`
+    obs_dim : int
+        observation dimension
+    action_dim : int
+        action dimension
+    n_init : int, optional
+        number of random initializations to average over, by default 100 (as in the paper)
+    grid_size : int, optional
+        forwarded to `sample_function_grid`, by default 300
+    input_range : float, optional
+        forwarded to `sample_function_grid`, by default 100.0
+    device : torch.device, optional
+        device to run the forward passes on, by default cpu
+
+    Returns
+    -------
+    float
+        simplicity bias score s(f)
+    """
+    scores = []
+    for _ in range(n_init):
+        model = model_fn().to(device)
+        model.eval()
+        grid = sample_function_grid(model, obs_dim, action_dim, grid_size, input_range, device)
+        scores.append(1.0 / (function_complexity(grid) + 1e-12))
+    return sum(scores) / len(scores)
+
+
 def gradient_variance(
     model: nn.Module,
     loss_fn: Callable[[], torch.Tensor],
@@ -596,6 +724,27 @@ def log_losses(
     writer.add_scalar(f"{prefix}/qf2_loss", qf2_loss, global_step)
     writer.add_scalar(f"{prefix}/qf_loss", (qf1_loss + qf2_loss) / 2.0, global_step)
     writer.add_scalar(f"{prefix}/actor_loss", actor_loss, global_step)
+
+
+def log_simplicity_bias(
+    writer: SummaryWriter,
+    global_step: int,
+    model_fn: Callable[[], nn.Module],
+    obs_dim: int,
+    action_dim: int,
+    n_init: int = 100,
+    grid_size: int = 300,
+    input_range: float = 100.0,
+    device: torch.device = torch.device("cpu"),
+    name: str = "critic",
+    prefix: str = "debug",
+) -> None:
+    """Log the architecture's simplicity bias score (`simplicity_bias_score`).
+    This characterizes `model_fn`'s architecture/init distribution rather than
+    any particular trained network, so it's typically logged once rather than
+    on a training cadence."""
+    score = simplicity_bias_score(model_fn, obs_dim, action_dim, n_init, grid_size, input_range, device)
+    writer.add_scalar(f"{prefix}/{name}_simplicity_bias_score", score, global_step)
 
 
 def log_generalization_gap(
