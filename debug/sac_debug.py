@@ -566,7 +566,10 @@ def gradient_variance(
     -------
     dict[str, float]
         'grad_mean_norm', 'grad_total_variance', 'grad_variance_to_mean_ratio',
-        and 'grad_snr' (mean-gradient norm / total-variance std)
+        'grad_snr' (mean-gradient norm / total-variance std), and
+        'grad_snr_mean' (|mean_i| / std_i computed per parameter element, then
+        averaged over all elements, an average per-parameter SNR, as opposed
+        to 'grad_snr' which ratios the aggregated vector norm and variance)
     """
     grads_list = []
 
@@ -583,6 +586,7 @@ def gradient_variance(
     var_g = G.var(dim=0)
 
     return {
+        "grad_snr_mean": (mean_g.abs() / (var_g.sqrt() + 1e-8)).mean().item(),
         "grad_mean_norm": mean_g.norm().item(),
         "grad_total_variance": var_g.sum().item(),
         "grad_variance_to_mean_ratio": var_g.sum().item() / (mean_g.norm().item() ** 2 + 1e-8),
