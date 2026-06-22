@@ -176,21 +176,20 @@ def dead_relu_rate(model: nn.Module, *forward_args, threshold: float = 0.0) -> d
     return rates
 
 
-def gradient_lipschitz(critic: nn.Module, observations: torch.Tensor, actions: torch.Tensor) -> dict[str, float]:
+def gradient_lipschitz(critic: nn.Module, *inputs: torch.Tensor) -> dict[str, float]:
     """Local Lipschitz estimate of `critic` via its input-gradient norm.
 
-    ||grad_(s,a) Q(s,a)|| bounds how much Q can change for a small input
+    ||grad_x Q(x)|| bounds how much Q can change for a small input
     perturbation — a single extra forward+backward pass, much cheaper than
     estimating a Lipschitz constant via finite differences.
 
     Parameters
     ----------
     critic : nn.Module
-        SoftQNetwork-like module called as `critic(observations, actions)`
-    observations : torch.Tensor
-        batch of observations, shape (B, obs_dim)
-    actions : torch.Tensor
-        batch of actions, shape (B, action_dim)
+        network called as `critic(*inputs)`, e.g. a SoftQNetwork-like module
+        as `critic(observations, actions)` or `critic(observations)`
+    *inputs : torch.Tensor
+        tensors to differentiate w.r.t., each with batch dimension 0
 
     Returns
     -------
@@ -198,12 +197,11 @@ def gradient_lipschitz(critic: nn.Module, observations: torch.Tensor, actions: t
         'grad_lipschitz_max', 'grad_lipschitz_p99', 'grad_lipschitz_mean' of
         the per-sample input-gradient norm over the batch
     """
-    s = observations.clone().requires_grad_(True)
-    a = actions.clone().requires_grad_(True)
+    xs = [x.clone().float().requires_grad_(True) for x in inputs]
 
-    q = critic(s, a).sum()
-    grad_s, grad_a = torch.autograd.grad(q, [s, a])
-    g_norm = torch.cat([grad_s, grad_a], dim=-1).norm(dim=-1)
+    q = critic(*xs).sum()
+    grads = torch.autograd.grad(q, xs)
+    g_norm = torch.cat([g.flatten(1) for g in grads], dim=-1).norm(dim=-1)
 
     return {
         "grad_lipschitz_max": g_norm.max().item(),
@@ -253,7 +251,7 @@ def effective_scale_normalized_layers(model: nn.Module) -> dict[str, dict[str, f
 
 
 def weight_norm_per_layer(model: nn.Module) -> dict[str, float]:
-    """L2 norm of every `nn.Linear` layer's weight matrix in `model`.
+    """L2 norm of every `nn.Linear`/`nn.Conv2d` layer's weight tensor in `model`.
 
     Pure parameter property — no forward pass needed, so cheap enough to log
     frequently. Tracks how each layer's weight scale evolves over training.
@@ -261,15 +259,19 @@ def weight_norm_per_layer(model: nn.Module) -> dict[str, float]:
     Parameters
     ----------
     model : nn.Module
-        network to scan for `nn.Linear` submodules
+        network to scan for `nn.Linear`/`nn.Conv2d` submodules
 
     Returns
     -------
     dict[str, float]
-        weight-matrix L2 norm of each `nn.Linear` submodule, keyed by its
-        name from `named_modules()`
+        weight-tensor L2 norm of each `nn.Linear`/`nn.Conv2d` submodule, keyed
+        by its name from `named_modules()`
     """
-    return {name: m.weight.detach().norm().item() for name, m in model.named_modules() if isinstance(m, nn.Linear)}
+    return {
+        name: m.weight.detach().norm().item()
+        for name, m in model.named_modules()
+        if isinstance(m, (nn.Linear, nn.Conv2d))
+    }
 
 
 def hessian_top_eigenvalue(
@@ -586,16 +588,16 @@ def log_layer_activation_stats(
     global_step: int,
     qf1: nn.Module,
     qf2: nn.Module,
-    observations: torch.Tensor,
-    actions: torch.Tensor,
+    *forward_args: torch.Tensor,
     prefix: str = "debug",
     dead_threshold: float = 0.0,
 ) -> None:
     """Log effective rank of every `nn.Linear` layer's output and dead-unit
     fractions of every `nn.ReLU` layer, for qf1 and qf2, from one forward
-    pass per network."""
+    pass per network. `*forward_args` are forwarded to `model(*forward_args)`,
+    e.g. `(observations, actions)` or `(observations,)`."""
     for name, model in (("qf1", qf1), ("qf2", qf2)):
-        linear_acts, relu_acts = _capture_activations(model, observations, actions)
+        linear_acts, relu_acts = _capture_activations(model, *forward_args)
         for layer_name, act in linear_acts.items():
             writer.add_scalar(f"{prefix}/{name}_effective_rank_{layer_name}", effective_rank(act), global_step)
         for layer_name, act in relu_acts.items():
@@ -617,13 +619,14 @@ def log_gradient_lipschitz(
     global_step: int,
     qf1: nn.Module,
     qf2: nn.Module,
-    observations: torch.Tensor,
-    actions: torch.Tensor,
+    *inputs: torch.Tensor,
     prefix: str = "debug",
 ) -> None:
-    """Log the input-gradient-norm Lipschitz estimate for qf1 and qf2."""
+    """Log the input-gradient-norm Lipschitz estimate for qf1 and qf2.
+    `*inputs` are forwarded to `gradient_lipschitz`, e.g.
+    `(observations, actions)` or `(observations,)`."""
     for name, critic in (("qf1", qf1), ("qf2", qf2)):
-        for stat_name, value in gradient_lipschitz(critic, observations, actions).items():
+        for stat_name, value in gradient_lipschitz(critic, *inputs).items():
             writer.add_scalar(f"{prefix}/{name}_{stat_name}", value, global_step)
 
 
@@ -699,6 +702,20 @@ def log_action_stats(
     writer.add_scalar(f"{prefix}/action_std", actions.std().item(), global_step)
 
 
+def log_action_distribution_stats(
+    writer: SummaryWriter,
+    global_step: int,
+    action_probs: torch.Tensor,
+    prefix: str = "debug",
+) -> None:
+    """Discrete-policy analog of `log_action_stats`: logs the policy's
+    confidence (max action probability) over the batch, e.g. for tracking
+    the actor's action distribution on a fixed set of states."""
+    max_prob = action_probs.max(dim=1).values
+    writer.add_scalar(f"{prefix}/action_prob_max_mean", max_prob.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/action_prob_max_std", max_prob.std().item(), global_step)
+
+
 def log_log_pi_stats(
     writer: SummaryWriter,
     global_step: int,
@@ -710,6 +727,26 @@ def log_log_pi_stats(
     writer.add_scalar(f"{prefix}/log_pi_std", log_pi.std().item(), global_step)
     writer.add_scalar(f"{prefix}/next_state_log_pi_mean", next_state_log_pi.mean().item(), global_step)
     writer.add_scalar(f"{prefix}/next_state_log_pi_std", next_state_log_pi.std().item(), global_step)
+
+
+def log_log_pi_stats_discrete(
+    writer: SummaryWriter,
+    global_step: int,
+    log_pi: torch.Tensor,
+    action_probs: torch.Tensor,
+    next_state_log_pi: torch.Tensor,
+    next_state_action_probs: torch.Tensor,
+    prefix: str = "debug",
+) -> None:
+    """Discrete-policy analog of `log_log_pi_stats`: logs the categorical
+    policy's entropy -sum(action_probs * log_pi, dim=1) at the current and
+    next states."""
+    entropy = -(action_probs * log_pi).sum(dim=1)
+    next_state_entropy = -(next_state_action_probs * next_state_log_pi).sum(dim=1)
+    writer.add_scalar(f"{prefix}/policy_entropy_mean", entropy.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/policy_entropy_std", entropy.std().item(), global_step)
+    writer.add_scalar(f"{prefix}/next_state_policy_entropy_mean", next_state_entropy.mean().item(), global_step)
+    writer.add_scalar(f"{prefix}/next_state_policy_entropy_std", next_state_entropy.std().item(), global_step)
 
 
 def log_losses(

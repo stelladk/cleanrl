@@ -3,6 +3,10 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from typing import cast
+
+from debug.sac_debug import *
+from debug.split_replay_buffer import SplitReplayBuffer
 
 import gymnasium as gym
 import numpy as np
@@ -72,6 +76,10 @@ class Args:
     """automatic tuning of the entropy coefficient"""
     target_entropy_scale: float = 0.89
     """coefficient for scaling the autotune entropy target"""
+    debug: bool = False
+    """if toggled, log additional diagnostic metrics (grad norms, Q-value stats, log-pi stats)"""
+    holdout_fraction: float = 0.1
+    """fraction of the replay buffer held out (debug mode only) for separate metric logging"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -127,10 +135,12 @@ class SoftQNetwork(nn.Module):
 
         self.fc1 = layer_init(nn.Linear(output_dim, 512))
         self.fc_q = layer_init(nn.Linear(512, envs.single_action_space.n))
+        self.relu_conv = nn.ReLU()
+        self.relu_fc1 = nn.ReLU()
 
     def forward(self, x):
-        x = F.relu(self.conv(x / 255.0))
-        x = F.relu(self.fc1(x))
+        x = self.relu_conv(self.conv(x / 255.0))
+        x = self.relu_fc1(self.fc1(x))
         q_vals = self.fc_q(x)
         return q_vals
 
@@ -153,10 +163,12 @@ class Actor(nn.Module):
 
         self.fc1 = layer_init(nn.Linear(output_dim, 512))
         self.fc_logits = layer_init(nn.Linear(512, envs.single_action_space.n))
+        self.relu_conv = nn.ReLU()
+        self.relu_fc1 = nn.ReLU()
 
     def forward(self, x):
-        x = F.relu(self.conv(x))
-        x = F.relu(self.fc1(x))
+        x = self.relu_conv(self.conv(x))
+        x = self.relu_fc1(self.fc1(x))
         logits = self.fc_logits(x)
 
         return logits
@@ -224,14 +236,41 @@ if __name__ == "__main__":
     else:
         alpha = args.alpha
 
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        handle_timeout_termination=False,
-    )
+    if args.debug:
+        rb = SplitReplayBuffer(
+            args.buffer_size,
+            envs.single_observation_space,
+            envs.single_action_space,
+            device,
+            handle_timeout_termination=False,
+            holdout_fraction=args.holdout_fraction,
+            min_train_size=args.batch_size,
+        )
+    else:
+        rb = ReplayBuffer(
+            args.buffer_size,
+            envs.single_observation_space,
+            envs.single_action_space,
+            device,
+            handle_timeout_termination=False,
+        )
     start_time = time.time()
+    if args.debug:
+        qf_grad_norm = actor_grad_norm = alpha_grad_norm = 0.0
+        # Fixed reference batch for Hessian sharpness only: sampled once from
+        # holdout, with the actor's frozen next-state action-probability
+        # distribution (and its log-probs) at cache time, so later sharpness
+        # comparisons aren't confounded by actor drift.
+        ref_data = None
+        ref_next_state_action_probs = None
+        ref_next_state_log_pi = None
+
+        # Debug-mode logging cadences (see CrossQ investigation metrics table)
+        DEBUG_WEIGHT_NORM_FREQ = 1_000      # critic weight norms / effective scale
+        DEBUG_HOLDOUT_BATCH_FREQ = 5_000    # effective rank, dead-ReLU, actor entropy, generalization gap (fresh holdout sample)
+        DEBUG_LIPSCHITZ_FREQ = 5_000        # critic Lipschitz (fresh holdout sample)
+        DEBUG_GRAD_VARIANCE_FREQ = 5_000    # gradient variance/SNR (train buffer)
+        DEBUG_SHARPNESS_FREQ = 25_000       # critic Hessian sharpness (fixed reference batch, frozen action distribution)
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
@@ -295,6 +334,8 @@ if __name__ == "__main__":
 
                 q_optimizer.zero_grad()
                 qf_loss.backward()
+                if args.debug:
+                    qf_grad_norm = compute_grad_norm(qf1, qf2)
                 q_optimizer.step()
 
                 # ACTOR training
@@ -308,6 +349,8 @@ if __name__ == "__main__":
 
                 actor_optimizer.zero_grad()
                 actor_loss.backward()
+                if args.debug:
+                    actor_grad_norm = compute_grad_norm(actor)
                 actor_optimizer.step()
 
                 if args.autotune:
@@ -316,6 +359,8 @@ if __name__ == "__main__":
 
                     a_optimizer.zero_grad()
                     alpha_loss.backward()
+                    if args.debug:
+                        alpha_grad_norm = compute_grad_norm(log_alpha)
                     a_optimizer.step()
                     alpha = log_alpha.exp().item()
 
@@ -338,6 +383,147 @@ if __name__ == "__main__":
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+                if args.debug:
+                    log_grad_norms(writer, global_step, qf_grad_norm, actor_grad_norm,
+                                   alpha_grad_norm if args.autotune else None)
+                    log_q_stats(writer, global_step, qf1_a_values, qf2_a_values, next_q_value)
+
+                    split_rb = cast(SplitReplayBuffer, rb)
+
+                    # Critic weight norms / effective scale: free, param-only.
+                    if global_step % DEBUG_WEIGHT_NORM_FREQ == 0:
+                        log_weight_norms(writer, global_step, qf1, qf2)
+                        log_normalization_scales(writer, global_step, qf1, qf2)
+
+                    # Effective rank, dead-ReLU rate, actor entropy/action
+                    # distribution, and generalization gap all use a fresh
+                    # sample from the holdout buffer at the same cadence.
+                    if split_rb.holdout_size() >= args.batch_size and global_step % DEBUG_HOLDOUT_BATCH_FREQ == 0:
+                        holdout_data = split_rb.sample_holdout(args.batch_size)
+                        with torch.no_grad():
+                            _, holdout_next_state_log_pi, holdout_next_state_action_probs = actor.get_action(
+                                holdout_data.next_observations
+                            )
+                            holdout_qf1_next_target = qf1_target(holdout_data.next_observations)
+                            holdout_qf2_next_target = qf2_target(holdout_data.next_observations)
+                            holdout_min_qf_next_target = holdout_next_state_action_probs * (
+                                torch.min(holdout_qf1_next_target, holdout_qf2_next_target)
+                                - alpha * holdout_next_state_log_pi
+                            )
+                            holdout_min_qf_next_target = holdout_min_qf_next_target.sum(dim=1)
+                            holdout_next_q_value = holdout_data.rewards.flatten() + (
+                                1 - holdout_data.dones.flatten()
+                            ) * args.gamma * holdout_min_qf_next_target
+
+                            holdout_qf1_values = qf1(holdout_data.observations)
+                            holdout_qf2_values = qf2(holdout_data.observations)
+                            holdout_qf1_a_values = holdout_qf1_values.gather(1, holdout_data.actions.long()).view(-1)
+                            holdout_qf2_a_values = holdout_qf2_values.gather(1, holdout_data.actions.long()).view(-1)
+                            holdout_qf1_loss = F.mse_loss(holdout_qf1_a_values, holdout_next_q_value)
+                            holdout_qf2_loss = F.mse_loss(holdout_qf2_a_values, holdout_next_q_value)
+
+                            _, holdout_log_pi, holdout_action_probs = actor.get_action(holdout_data.observations)
+                            holdout_qf1_pi = qf1(holdout_data.observations)
+                            holdout_qf2_pi = qf2(holdout_data.observations)
+                            holdout_min_qf_pi = torch.min(holdout_qf1_pi, holdout_qf2_pi)
+                            holdout_actor_loss = (holdout_action_probs * ((alpha * holdout_log_pi) - holdout_min_qf_pi)).mean()
+
+                        log_q_stats(
+                            writer, global_step, holdout_qf1_a_values, holdout_qf2_a_values, holdout_next_q_value,
+                            prefix="holdout",
+                        )
+                        log_losses(
+                            writer, global_step,
+                            holdout_qf1_loss.item(), holdout_qf2_loss.item(), holdout_actor_loss.item(),
+                            prefix="holdout",
+                        )
+                        log_generalization_gap(
+                            writer, global_step,
+                            qf1_loss.item(), qf2_loss.item(), actor_loss.item(),
+                            holdout_qf1_loss.item(), holdout_qf2_loss.item(), holdout_actor_loss.item(),
+                            prefix="holdout",
+                        )
+                        log_log_pi_stats_discrete(
+                            writer, global_step, holdout_log_pi, holdout_action_probs,
+                            holdout_next_state_log_pi, holdout_next_state_action_probs, prefix="holdout",
+                        )
+                        log_action_distribution_stats(writer, global_step, holdout_action_probs, prefix="holdout")
+                        log_layer_activation_stats(
+                            writer, global_step, qf1, qf2, holdout_data.observations, prefix="holdout"
+                        )
+
+                    # Critic Lipschitz: fresh holdout sample, coarser cadence.
+                    if split_rb.holdout_size() >= args.batch_size and global_step % DEBUG_LIPSCHITZ_FREQ == 0:
+                        lipschitz_data = split_rb.sample_holdout(args.batch_size)
+                        log_gradient_lipschitz(
+                            writer, global_step, qf1, qf2, lipschitz_data.observations, prefix="holdout"
+                        )
+
+                    # Gradient variance/SNR: fresh resamples from the train
+                    # buffer, since this is specifically about training-loss
+                    # gradient noise.
+                    if global_step % DEBUG_GRAD_VARIANCE_FREQ == 0:
+                        def make_sample_qf_loss_fn(critic):
+                            def sample_qf_loss_fn():
+                                sample = rb.sample(args.batch_size)
+                                with torch.no_grad():
+                                    _, sample_next_state_log_pi, sample_next_state_action_probs = actor.get_action(
+                                        sample.next_observations
+                                    )
+                                    sample_qf1_next_target = qf1_target(sample.next_observations)
+                                    sample_qf2_next_target = qf2_target(sample.next_observations)
+                                    sample_min_qf_next_target = sample_next_state_action_probs * (
+                                        torch.min(sample_qf1_next_target, sample_qf2_next_target)
+                                        - alpha * sample_next_state_log_pi
+                                    )
+                                    sample_min_qf_next_target = sample_min_qf_next_target.sum(dim=1)
+                                    sample_next_q_value = sample.rewards.flatten() + (
+                                        1 - sample.dones.flatten()
+                                    ) * args.gamma * sample_min_qf_next_target
+                                return F.mse_loss(
+                                    critic(sample.observations).gather(1, sample.actions.long()).view(-1),
+                                    sample_next_q_value,
+                                )
+                            return sample_qf_loss_fn
+
+                        log_gradient_variance_stats(writer, global_step, qf1, make_sample_qf_loss_fn(qf1), name="qf1")
+                        log_gradient_variance_stats(writer, global_step, qf2, make_sample_qf_loss_fn(qf2), name="qf2")
+
+                    # Critic Hessian sharpness: fixed reference batch with the
+                    # actor's frozen next-state action-probability
+                    # distribution (cached once), but current target networks
+                    # and alpha — isolates critic-only drift from actor drift.
+                    if ref_data is None and split_rb.holdout_size() >= args.batch_size:
+                        ref_data = split_rb.sample_holdout(args.batch_size)
+                        with torch.no_grad():
+                            _, ref_next_state_log_pi, ref_next_state_action_probs = actor.get_action(
+                                ref_data.next_observations
+                            )
+
+                    if ref_data is not None and global_step % DEBUG_SHARPNESS_FREQ == 0:
+                        with torch.no_grad():
+                            ref_qf1_next_target = qf1_target(ref_data.next_observations)
+                            ref_qf2_next_target = qf2_target(ref_data.next_observations)
+                            ref_min_qf_next_target = ref_next_state_action_probs * (
+                                torch.min(ref_qf1_next_target, ref_qf2_next_target) - alpha * ref_next_state_log_pi
+                            )
+                            ref_min_qf_next_target = ref_min_qf_next_target.sum(dim=1)
+                            ref_next_q_value = ref_data.rewards.flatten() + (
+                                1 - ref_data.dones.flatten()
+                            ) * args.gamma * ref_min_qf_next_target
+
+                        def ref_qf1_loss_fn():
+                            return F.mse_loss(
+                                qf1(ref_data.observations).gather(1, ref_data.actions.long()).view(-1), ref_next_q_value
+                            )
+
+                        def ref_qf2_loss_fn():
+                            return F.mse_loss(
+                                qf2(ref_data.observations).gather(1, ref_data.actions.long()).view(-1), ref_next_q_value
+                            )
+
+                        log_sharpness_stats(writer, global_step, qf1, ref_qf1_loss_fn, name="qf1", prefix="holdout")
+                        log_sharpness_stats(writer, global_step, qf2, ref_qf2_loss_fn, name="qf2", prefix="holdout")
 
     envs.close()
     writer.close()
