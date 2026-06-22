@@ -74,15 +74,16 @@ def effective_rank(activations: torch.Tensor, eps: float = 1e-12) -> float:
 
 def _capture_activations(model: nn.Module, *forward_args) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Run `model(*forward_args)` once and return the outputs of every
-    `nn.Linear` and `nn.ReLU` submodule, each keyed by its name from
-    `named_modules()`.
+    `nn.Linear` and activation (`nn.ReLU`/`nn.SELU`) submodule, each keyed by
+    its name from `named_modules()`.
 
     Architecture-agnostic: discovers layers by type rather than assuming
     fixed names or depth, so it works for SoftQNetwork, Actor, or any other
-    module built from `nn.Linear` and `nn.ReLU` instances (rather than the
-    functional `F.relu`). Hooking both module types in a single forward pass
-    lets `effective_rank_per_layer`, `dead_relu_rate`, and
-    `log_layer_activation_stats` share one pass instead of two.
+    module built from `nn.Linear` and `nn.ReLU`/`nn.SELU` instances (rather
+    than the functional `F.relu`/`F.selu`) — including the `--selu` variants
+    of those networks. Hooking both module types in a single forward pass
+    lets `effective_rank_per_layer`, `dead_relu_rate`, `active_neuron_ratio`,
+    and `log_layer_activation_stats` share one pass instead of two.
 
     Parameters
     ----------
@@ -94,8 +95,8 @@ def _capture_activations(model: nn.Module, *forward_args) -> tuple[dict[str, tor
     Returns
     -------
     tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]
-        (linear_activations, relu_activations), each mapping submodule name
-        to its output
+        (linear_activations, activation_activations), each mapping submodule
+        name to its output
     """
     linear_acts: dict[str, torch.Tensor] = {}
     relu_acts: dict[str, torch.Tensor] = {}
@@ -109,7 +110,7 @@ def _capture_activations(model: nn.Module, *forward_args) -> tuple[dict[str, tor
     for name, m in model.named_modules():
         if isinstance(m, nn.Linear):
             handles.append(m.register_forward_hook(make_hook(linear_acts, name)))
-        elif isinstance(m, nn.ReLU):
+        elif isinstance(m, (nn.ReLU, nn.SELU)):
             handles.append(m.register_forward_hook(make_hook(relu_acts, name)))
 
     try:
@@ -174,6 +175,49 @@ def dead_relu_rate(model: nn.Module, *forward_args, threshold: float = 0.0) -> d
             "zero_activation_fraction": (act <= threshold).float().mean().item(),
         }
     return rates
+
+
+def active_neuron_ratio(model: nn.Module, *forward_args, tau: float = 0.1) -> dict[str, float]:
+    """Fraction of "active" (non-dormant) units per activation layer of
+    `model`, following the normalized dormant-neuron score of Sokar et al.
+    (https://arxiv.org/abs/2302.12902) eq. (1): a unit i in layer l is
+    tau-dormant if `s_i = mean_batch(|h_i|) / mean_units(mean_batch(|h|)) <= tau`,
+    i.e. its average magnitude is at most a `tau` fraction of its layer's
+    average unit magnitude. Normalizing per layer (rather than thresholding
+    raw activation values, as `dead_relu_rate` does) makes the threshold
+    comparable across layers of different width and activation scale, and
+    also catches units that fire but only weakly.
+
+    Parameters
+    ----------
+    model : nn.Module
+        network to probe (called as `model(*forward_args)`)
+    *forward_args : torch.Tensor
+        positional inputs to `model.forward`
+    tau : float, optional
+        dormancy threshold on the normalized score, by default 0.1 (`tau=0.0`
+        recovers "never fires at all")
+
+    Returns
+    -------
+    dict[str, float]
+        fraction of active units per activation layer, keyed by its name from
+        `named_modules()`, plus an 'overall' entry pooling all activation
+        layers together
+    """
+    _, relu_acts = _capture_activations(model, *forward_args)
+    ratios = {}
+    total_active, total_units = 0.0, 0
+    for name, act in relu_acts.items():
+        mean_abs_per_unit = act.abs().mean(dim=0)  # shape: (d,)
+        layer_avg = mean_abs_per_unit.mean().clamp(min=1e-12)
+        is_active = (mean_abs_per_unit / layer_avg) > tau
+        ratios[name] = is_active.float().mean().item()
+        total_active += is_active.sum().item()
+        total_units += is_active.numel()
+    if total_units > 0:
+        ratios["overall"] = total_active / total_units
+    return ratios
 
 
 def gradient_lipschitz(critic: nn.Module, observations: torch.Tensor, actions: torch.Tensor) -> dict[str, float]:
@@ -590,14 +634,16 @@ def log_layer_activation_stats(
     actions: torch.Tensor,
     prefix: str = "debug",
     dead_threshold: float = 0.0,
+    active_tau: float = 0.1,
 ) -> None:
-    """Log effective rank of every `nn.Linear` layer's output and dead-unit
-    fractions of every `nn.ReLU` layer, for qf1 and qf2, from one forward
-    pass per network."""
+    """Log effective rank of every `nn.Linear` layer's output, dead-unit
+    fractions, and active-neuron ratio (`active_neuron_ratio`) of every
+    activation layer, for qf1 and qf2, from one forward pass per network."""
     for name, model in (("qf1", qf1), ("qf2", qf2)):
         linear_acts, relu_acts = _capture_activations(model, observations, actions)
         for layer_name, act in linear_acts.items():
             writer.add_scalar(f"{prefix}/{name}_effective_rank_{layer_name}", effective_rank(act), global_step)
+        total_active, total_units = 0.0, 0
         for layer_name, act in relu_acts.items():
             max_per_unit = act.max(dim=0).values
             writer.add_scalar(
@@ -610,6 +656,18 @@ def log_layer_activation_stats(
                 (act <= dead_threshold).float().mean().item(),
                 global_step,
             )
+            mean_abs_per_unit = act.abs().mean(dim=0)
+            layer_avg = mean_abs_per_unit.mean().clamp(min=1e-12)
+            is_active = (mean_abs_per_unit / layer_avg) > active_tau
+            writer.add_scalar(
+                f"{prefix}/{name}_active_neuron_ratio_{layer_name}",
+                is_active.float().mean().item(),
+                global_step,
+            )
+            total_active += is_active.sum().item()
+            total_units += is_active.numel()
+        if total_units > 0:
+            writer.add_scalar(f"{prefix}/{name}_active_neuron_ratio_overall", total_active / total_units, global_step)
 
 
 def log_gradient_lipschitz(
